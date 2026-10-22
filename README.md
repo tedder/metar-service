@@ -49,7 +49,7 @@ the origin-request event, which CloudFront then caches.
 
 ### Request
 
-`GET /metar?ids=<ICAO,ICAO,...>[&boardid=<id>][&output=csv|json][&help=1][&debug=<string>]`
+`GET /metar?ids=<ICAO,ICAO,...>[&boardid=<id>][&output=csv|json][&help=1]`
 
 | Parameter | Meaning |
 |---|---|
@@ -57,12 +57,11 @@ the origin-request event, which CloudFront then caches.
 | `boardid` | Optional device identifier, used as given (not shortened; current clients send 12 hex characters). Logged; part of the cache key, so per-device answers stay separate once gating exists. |
 | `output` | `csv` (default) or `json`. |
 | `help` | `1` returns documentation instead of data (no upstream request). |
-| `debug` | Optional string, logged, not part of the cache key. |
 
-Clients may add their own parameters (the ESP32 weather glass sends `fw`, `t` telemetry and
-`localip`). The origin request policy
-forwards only `ids`, `boardid`, `output`, `help` and `debug`, so the function never sees the others:
-they appear only in CloudFront's access logs, which is the place to watch a fleet from.
+Clients may add their own parameters (the ESP32 weather glass sends `debug` flags, `fw`, `t`
+telemetry and `localip`). CloudFront forwards only `ids`, `boardid`, `output` and `help` to the
+function, so it never sees the others: they appear only in CloudFront's access logs, for every
+request including cache hits, which is the place to watch a fleet from.
 
 ### Response (CSV, default)
 
@@ -200,7 +199,7 @@ matches the repo, and that the zipped handler loads and answers a help request.
    association to the function version from step 1. Allow HTTP as well as HTTPS for the viewer
    protocol, since the point is to serve devices without TLS. Use a cache policy whose query-string
    whitelist is `ids`, `boardid`, `output`, `help` (TTL min 0, default and max 300 s), and an origin
-   request policy that forwards those plus `debug`. Turn on CloudFront access logs if you want the
+   request policy that forwards the same four. Turn on CloudFront access logs if you want the
    client telemetry parameters, since the function doesn't receive them.
 
 3. **Test the version before switching to it.** Invoke the new version with a sample CloudFront

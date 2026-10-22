@@ -106,7 +106,6 @@ const HELP_PARAMS = [
   { name: 'boardid', desc: 'Optional device identifier, used as given; logged and part of the cache key (for future gating).' },
   { name: 'output',  desc: '"csv" (default) or "json"' },
   { name: 'help',    desc: 'Set to 1 to return documentation. Same if ids is omitted or empty; no upstream fetch.' },
-  { name: 'debug',   desc: 'Optional debug flag (string), logged but not used in cache key.' },
 ];
 
 const HELP_NOTES = [
@@ -206,7 +205,6 @@ exports.handler = async (event) => {
   const ids = parseIds(params.get('ids'));
   const boardid = params.get('boardid') || '';
   const output = params.get('output') === 'json' ? 'json' : 'csv';
-  const debug = params.get('debug') || '';
   const help = params.get('help');
   const allParams = Object.fromEntries(params.entries());
 

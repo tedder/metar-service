@@ -253,7 +253,7 @@ Columns: `icao, cat, r-g-b, age_mins, stale`
 - `cat` empty = no METAR data (bad ICAO or non-reporting station)
 - color `75-75-50` = no data (matches device pre-fetch init color)
 - `output=json` returns JSON array for debugging
-- `debug=0x{flags}` logged server-side, not in cache key
+- `debug=0x{flags}`: client debug flags, not in the cache key and (since v16) not forwarded to the function; read them in the CloudFront access logs
 
 ### Deploy Command (update Lambda code)
 
@@ -274,7 +274,7 @@ AWS_PROFILE=pjnet aws lambda publish-version \
 
 **Source of truth: CloudWatch Logs**, region `us-west-2`, log group `/aws/lambda/us-east-1.metar-service`.
 
-Success log line (JSON): the forwarded GET params spread in (`ids`, `boardid`, `output`, `help`, `debug`: the origin request policy forwards only these), plus `ids` (parsed array), `count`, `elapsed_ms`. Client telemetry (`crash`, `fetches`, `fw`, `t`, `localip`) never reaches the function; it is only in the CloudFront access logs.
+Success log line (JSON): the forwarded GET params spread in (`ids`, `boardid`, `output`, `help`: the origin request policy forwards only these since v16; v15 also forwarded `debug`), plus `ids` (parsed array), `count`, `elapsed_ms`. Client telemetry (`crash`, `fetches`, `fw`, `t`, `localip`) never reaches the function; it is only in the CloudFront access logs.
 
 Query with:
 ```bash
@@ -299,7 +299,7 @@ All errors logged via `console.error` → CloudWatch Logs `/aws/lambda/metar-ser
 3. IAM role with `lambda.amazonaws.com` + `edgelambda.amazonaws.com` principals
 4. Lambda function created in `us-east-1` (Node.js 20.x, 128MB, 30s timeout)
 5. Version 1 published
-6. CloudFront cache policy created (TTL 0/300/300; key whitelist now `ids`, `boardid`, `output`, `help`), origin request policy forwards those plus `debug`
+6. CloudFront cache policy created (TTL 0/300/300; key whitelist now `ids`, `boardid`, `output`, `help`), origin request policy forwards the same four (plus `debug` through v15)
 7. `/metar*` behavior added to `E191F8VQXITFIN` (viewer protocol: allow-all, Lambda@Edge origin-request)
 
 ## Phase 2
