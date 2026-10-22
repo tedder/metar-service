@@ -1,7 +1,8 @@
 # metar-service
 
 A small METAR proxy for LED weather maps. A device asks for a list of airports; the service fetches
-the current METARs from the Aviation Weather Center (AWC), works out each airport's flight category
+the current METARs from the National Weather Service's Aviation Weather Center (AWC, the data API at
+`https://aviationweather.gov/api/data/metar`), works out each airport's flight category
 (VFR, MVFR, IFR, LIFR), and answers with one short line per airport: category, an LED color, the
 report's age, a stale flag and the wind. The device sets its LEDs straight from that answer.
 
