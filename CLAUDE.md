@@ -306,3 +306,29 @@ All errors logged via `console.error` → CloudWatch Logs `/aws/lambda/metar-ser
 - Gate on `boardid` (allowlist of known board UIDs)
 - `/airports/{boardid}` — server-managed airport list per device
 - Structured CloudWatch logging (ids, boardid, cache miss reason, upstream latency)
+
+---
+
+## Flight categories — source
+
+Categories and colors follow **FAA AC 00-45H (Change 2), Table 3-14 "Station Plot Weather
+Categories"**: https://www.faa.gov/documentLibrary/media/Advisory_Circular/AC_00-45H_Chg_2.pdf
+
+| Category | Color | Ceiling (ft AGL) | | Visibility (SM) |
+|---|---|---|---|---|
+| LIFR | magenta | below 500 | and/or | less than 1 |
+| IFR | red | 500 to below 1,000 | and/or | 1 to less than 3 |
+| MVFR | blue | 1,000 to 3,000 (inclusive) | and/or | 3 to 5 (inclusive) |
+| VFR | green | greater than 3,000 | and | greater than 5 |
+
+Ceiling = lowest BKN/OVC/OVX (VV) layer. `processMetar()` uses AWC's `fltCat` when present
+(AWC applies the same table) and falls back to `flightCategory()`.
+
+**History:** through v14 the MVFR upper bounds were exclusive (3,000 ft or 5 SM showed VFR).
+Fixed in Lambda version 15 (2026-10-16); edge cases in `index.test.js`. Verified against AWC
+`fltCat` on 798 live METARs (0 mismatches; 14 before).
+
+**Deploy:** zip `index.js` → `aws lambda update-function-code --function-name metar-service
+--region us-east-1 --zip-file fileb://deploy.zip --publish` → invoke the new version directly
+with a CloudFront event → point distribution `E191F8VQXITFIN` `/metar*` origin-request
+association at the new version. Rollback = point it back. (`AWS_PROFILE=pjnet`)
