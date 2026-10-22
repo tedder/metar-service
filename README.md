@@ -59,8 +59,8 @@ the origin-request event, which CloudFront then caches.
 | `help` | `1` returns documentation instead of data (no upstream request). |
 | `debug` | Optional string, logged, not part of the cache key. |
 
-Clients may add their own parameters (the CircuitPython map sends `crash`, its last reset reason, and
-`fetches`; the ESP32 weather glass sends `fw`, `t` telemetry and `localip`). The origin request policy
+Clients may add their own parameters (the ESP32 weather glass sends `fw`, `t` telemetry and
+`localip`). The origin request policy
 forwards only `ids`, `boardid`, `output`, `help` and `debug`, so the function never sees the others:
 they appear only in CloudFront's access logs, which is the place to watch a fleet from.
 
@@ -164,8 +164,7 @@ with any query parameters the origin request policy doesn't forward.
 
 ## Packaging
 
-The deployment package is a zip containing `index.js` alone, about 10 KB (the deployed one has
-exactly that one file). Nothing else belongs in it:
+The deployment package is a zip containing `index.js` alone, about 10 KB. Nothing else belongs in it:
 
 - **No dependencies.** The code has no `require()` calls; `fetch` and `URLSearchParams` are built into
   Node 18 and later, so there is no `node_modules` and no `package.json`.
@@ -173,21 +172,29 @@ exactly that one file). Nothing else belongs in it:
   no measurable time, while minified code would make the stack traces in the error log unreadable.
 - Tests, docs and the workflow stay out of the zip.
 
+`scripts/build-zip.sh` builds it with a fixed timestamp and file mode, so the same `index.js` always
+gives the same bytes, on macOS and Linux alike. It prints the SHA-256 in hex and in base64; the
+base64 form is what Lambda reports as `CodeSha256`, which shows whether a deployed version is
+exactly this code. `node scripts/check-zip.js` checks that the zip holds only `index.js`, that it
+matches the repo, and that the zipped handler loads and answers a help request.
+
 ## Running your own
 
 1. **Function.** Create a Node.js Lambda in `us-east-1` (a Lambda@Edge requirement) with handler
    `index.handler`, 128 MB, and a timeout of a few seconds (AWC normally answers in well under one).
    The deployed function uses the `nodejs24.x` runtime. Give it an execution role that
    `edgelambda.amazonaws.com` and `lambda.amazonaws.com` can both assume, with basic logging
-   permissions. The code has no dependencies, so the deployment package is `index.js` alone:
+   permissions. Deploy the zip that CI built for the commit (the `deploy-zip-<sha>` artifact of
+   that commit's run), or build the same bytes locally:
 
    ```sh
-   zip deploy.zip index.js
+   gh run download <run-id> -n deploy-zip-<sha>     # or: ./scripts/build-zip.sh
    aws lambda update-function-code --region us-east-1 --function-name metar-service \
-     --zip-file fileb://deploy.zip --publish
+     --zip-file fileb://deploy.zip --publish --query '[Version,CodeSha256]'
    ```
 
-   `--publish` creates a numbered version. Lambda@Edge needs a version, not `$LATEST`.
+   `--publish` creates a numbered version. Lambda@Edge needs a version, not `$LATEST`. The
+   `CodeSha256` it prints should equal the one `build-zip.sh` printed.
 
 2. **CloudFront.** Add a cache behavior for `/metar*` to a distribution, with an origin-request
    association to the function version from step 1. Allow HTTP as well as HTTPS for the viewer
@@ -225,6 +232,8 @@ The handler's helpers (`visibMiles`, `getLowestCeiling`, `flightCategory`, `ledC
 `.github/workflows/ci.yml` runs on every push and pull request:
 
 - **test**: `node --check index.js` and `node --test` on Node 24 (the Lambda runtime);
+- **package** (after test): `scripts/build-zip.sh`, then `scripts/check-zip.js`, then uploads the
+  zip as the `deploy-zip-<sha>` artifact; the run summary shows its `CodeSha256`;
 - **secrets**: a gitleaks scan of the full history.
 
 GitHub's own secret scanning and push protection are enabled on the repository as well.
@@ -232,8 +241,8 @@ GitHub's own secret scanning and push protection are enabled on the repository a
 ## Clients
 
 Any device that can make an HTTP GET and split a line on commas can use it. It was written for a
-CircuitPython LED METAR map, and an ESP-IDF weather lamp uses it too; both set one LED per airport
-from the `r-g-b` column and use `stale` and the wind columns for their own effects.
+CircuitPython LED METAR map (retired); today's client is an ESP-IDF weather glass that sets its
+LEDs from the `r-g-b` column and uses `stale` and the wind columns for its own effects.
 
 ## License
 

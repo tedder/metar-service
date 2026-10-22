@@ -329,7 +329,7 @@ Ceiling = lowest BKN/OVC/OVX (VV) layer. `processMetar()` uses AWC's `fltCat` wh
 Fixed in Lambda version 15 (2026-10-16); edge cases in `index.test.js`. Verified against AWC
 `fltCat` on 798 live METARs (0 mismatches; 14 before).
 
-**Deploy:** zip `index.js` → `aws lambda update-function-code --function-name metar-service
+**Deploy:** `./scripts/build-zip.sh` (or the CI `deploy-zip-<sha>` artifact; same bytes, check `CodeSha256`) → `aws lambda update-function-code --function-name metar-service
 --region us-east-1 --zip-file fileb://deploy.zip --publish` → invoke the new version directly
 with a CloudFront event → point distribution `E191F8VQXITFIN` `/metar*` origin-request
 association at the new version. Rollback = point it back. (`AWS_PROFILE=pjnet`)

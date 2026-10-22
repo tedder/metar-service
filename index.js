@@ -103,7 +103,7 @@ const HELP_COLUMNS = [
 // Request parameter documentation
 const HELP_PARAMS = [
   { name: 'ids',     desc: 'Comma-separated ICAO codes for METAR data. Omit (or use help=1) for documentation; no upstream fetch.' },
-  { name: 'boardid', desc: 'Optional device identifier; logged for future gating. Truncated to 12 chars.' },
+  { name: 'boardid', desc: 'Optional device identifier, used as given; logged and part of the cache key (for future gating).' },
   { name: 'output',  desc: '"csv" (default) or "json"' },
   { name: 'help',    desc: 'Set to 1 to return documentation. Same if ids is omitted or empty; no upstream fetch.' },
   { name: 'debug',   desc: 'Optional debug flag (string), logged but not used in cache key.' },
@@ -207,7 +207,6 @@ exports.handler = async (event) => {
   const boardid = params.get('boardid') || '';
   const output = params.get('output') === 'json' ? 'json' : 'csv';
   const debug = params.get('debug') || '';
-  const crash = params.get('crash') || '';
   const help = params.get('help');
   const allParams = Object.fromEntries(params.entries());
 

@@ -18,6 +18,26 @@ jobs:
       - run: node --check index.js
       - run: node --test
 
+  package:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      - name: Build deploy.zip (index.js only, reproducible)
+        run: ./scripts/build-zip.sh | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Check deploy.zip (contents, matches repo, handler answers)
+        run: node scripts/check-zip.js
+      # The zip to deploy: download it from this run and compare its CodeSha256 with the
+      # Lambda version after publishing.
+      - uses: actions/upload-artifact@v5
+        with:
+          name: deploy-zip-${{ github.sha }}
+          path: deploy.zip
+          if-no-files-found: error
+
   secrets:
     runs-on: ubuntu-latest
     steps:
