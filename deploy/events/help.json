@@ -1,0 +1,1 @@
+{"Records": [{"cf": {"request": {"uri": "/metar", "method": "GET", "querystring": "help=1", "headers": {}}}}]}

@@ -1,0 +1,126 @@
+name: deploy
+
+# Manual only. Runs in the `production` environment: main branch only, and a required reviewer
+# must approve each run. AWS access is through GitHub's OIDC token and a role that trusts only
+# this repo's production environment (deploy/iam/trust.json); no AWS keys are stored.
+#   dry-run:  assume the role, build and check the zip, validate the code update without changing
+#             anything, smoke-test the live version, show what the CloudFront change would be.
+#   deploy:   publish the zip as a new version, check its CodeSha256, smoke-test it, point the
+#             /metar* behavior at it, wait for CloudFront.
+#   rollback: smoke-test an existing version, point /metar* at it, wait for CloudFront.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "dry-run, deploy, or rollback"
+        type: choice
+        options: [dry-run, deploy, rollback]
+        default: dry-run
+      version:
+        description: "rollback only: the Lambda version number to point /metar* at"
+        required: false
+
+permissions:
+  contents: read
+  id-token: write      # the OIDC token for AWS
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  FUNCTION_NAME: metar-service
+  AWS_REGION: us-east-1   # Lambda@Edge functions live in us-east-1
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1   # v7.1.0
+        with:
+          node-version: "24"
+
+      - name: Tests
+        run: node --check index.js && node --test
+
+      - name: Build and check deploy.zip
+        id: zip
+        run: |
+          ./scripts/build-zip.sh | tee -a "$GITHUB_STEP_SUMMARY"
+          node scripts/check-zip.js
+          echo "sha=$(openssl dgst -sha256 -binary deploy.zip | base64)" >> "$GITHUB_OUTPUT"
+
+      - name: AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd   # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+          role-session-name: metar-service-deploy-${{ github.run_id }}
+
+      - name: Current state
+        id: cur
+        env:
+          CF_DISTRIBUTION_ID: ${{ secrets.CF_DISTRIBUTION_ID }}
+        run: |
+          live=$(aws cloudfront get-distribution-config --id "$CF_DISTRIBUTION_ID" --output json | python3 -c '
+          import json, sys
+          c = json.load(sys.stdin)["DistributionConfig"]
+          b = [b for b in c["CacheBehaviors"]["Items"] if b["PathPattern"] == "/metar*"][0]
+          print([a for a in b["LambdaFunctionAssociations"]["Items"] if a["EventType"] == "origin-request"][0]["LambdaFunctionARN"].rsplit(":", 1)[1])')
+          echo "live=$live" >> "$GITHUB_OUTPUT"
+          echo "fn_arn=$(aws lambda get-function-configuration --function-name "$FUNCTION_NAME" --query FunctionArn --output text)" >> "$GITHUB_OUTPUT"
+          echo "CloudFront /metar* is on version $live" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Dry run
+        if: inputs.mode == 'dry-run'
+        env:
+          CF_DISTRIBUTION_ID: ${{ secrets.CF_DISTRIBUTION_ID }}
+        run: |
+          got=$(aws lambda update-function-code --function-name "$FUNCTION_NAME" --zip-file fileb://deploy.zip \
+                --dry-run --query CodeSha256 --output text)
+          [ "$got" = "${{ steps.zip.outputs.sha }}" ] || { echo "dry-run CodeSha256 $got != build ${{ steps.zip.outputs.sha }}"; exit 1; }
+          echo "code update validated (not applied); CodeSha256 matches the build" | tee -a "$GITHUB_STEP_SUMMARY"
+          ./deploy/smoke-test.sh "$FUNCTION_NAME" "${{ steps.cur.outputs.live }}" | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 scripts/point_cloudfront.py "$CF_DISTRIBUTION_ID" "${{ steps.cur.outputs.fn_arn }}:$(( ${{ steps.cur.outputs.live }} + 1 ))" --dry-run | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish
+        id: pub
+        if: inputs.mode == 'deploy'
+        run: |
+          read -r ver sha <<EOF
+          $(aws lambda update-function-code --function-name "$FUNCTION_NAME" --zip-file fileb://deploy.zip \
+            --publish --query '[Version,CodeSha256]' --output text)
+          EOF
+          [ "$sha" = "${{ steps.zip.outputs.sha }}" ] || { echo "published CodeSha256 $sha != build ${{ steps.zip.outputs.sha }}"; exit 1; }
+          aws lambda wait published-version-active --function-name "$FUNCTION_NAME" --qualifier "$ver"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "published version $ver, CodeSha256 matches the build" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Pick the version to serve
+        id: target
+        if: inputs.mode != 'dry-run'
+        env:
+          MODE: ${{ inputs.mode }}
+          PUBLISHED: ${{ steps.pub.outputs.version }}
+          ROLLBACK_TO: ${{ inputs.version }}   # via env, never pasted into the script
+        run: |
+          if [ "$MODE" = deploy ]; then v="$PUBLISHED"; else v="$ROLLBACK_TO"; fi
+          case "$v" in ''|*[!0-9]*) echo "version must be a number, got '$v'"; exit 1;; esac
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test
+        if: inputs.mode != 'dry-run'
+        run: ./deploy/smoke-test.sh "$FUNCTION_NAME" "${{ steps.target.outputs.version }}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Point /metar* at it
+        if: inputs.mode != 'dry-run'
+        env:
+          CF_DISTRIBUTION_ID: ${{ secrets.CF_DISTRIBUTION_ID }}
+        run: |
+          python3 scripts/point_cloudfront.py "$CF_DISTRIBUTION_ID" "${{ steps.cur.outputs.fn_arn }}:${{ steps.target.outputs.version }}" | tee -a "$GITHUB_STEP_SUMMARY"
+          aws cloudfront wait distribution-deployed --id "$CF_DISTRIBUTION_ID"
+          echo "CloudFront deployed: /metar* on version ${{ steps.target.outputs.version }} (was ${{ steps.cur.outputs.live }})" | tee -a "$GITHUB_STEP_SUMMARY"

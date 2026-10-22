@@ -208,6 +208,45 @@ matches the repo, and that the zipped handler loads and answers a help request.
 
 Replication to the edge takes a few minutes after an association changes.
 
+## Deploying with GitHub Actions
+
+`.github/workflows/deploy.yml` deploys from this repository. It is manual only (run it from the
+Actions tab or `gh workflow run deploy.yml -f mode=dry-run`) and has three modes:
+
+| Mode | What it does |
+|---|---|
+| `dry-run` (default) | Assumes the AWS role, runs the tests, builds and checks the zip, validates the code update with Lambda's `--dry-run` (nothing changes) and checks that its `CodeSha256` matches the build, smoke-tests the version CloudFront serves now, and prints what the CloudFront change would be. |
+| `deploy` | Publishes the zip as a new Lambda version, checks its `CodeSha256` against the build, smoke-tests the new version, points the `/metar*` behavior at it and waits for CloudFront to finish. |
+| `rollback` | Smoke-tests an existing version (the `version` input) and points `/metar*` back at it. |
+
+The smoke test (`deploy/smoke-test.sh`) invokes the version directly with two sample CloudFront
+events from `deploy/events/`: a help request, which must return the CSV header row, and a request
+for two airports, which must return a category for each (so the version can reach AWC). The
+CloudFront step (`scripts/point_cloudfront.py`) changes only the origin-request ARN of the
+`/metar*` behavior, refuses if anything else in the config would differ, and writes with the
+config's ETag so a concurrent change fails instead of being overwritten.
+
+**Who can run it.** On a public repository only people with write access can start a manual
+workflow, and pull requests from forks never receive secrets. The job also runs in the
+`production` environment, which allows only the `main` branch and needs a required reviewer to
+approve each run. AWS access uses GitHub's OIDC token: the role trusts only
+`repo:<owner>/<repo>:environment:production` (`deploy/iam/trust.json`), so no other repository,
+branch or workflow can assume it, and no AWS keys are stored. Its permissions
+(`deploy/iam/permissions.json`) cover publishing, reading and invoking this one function and
+reading and updating this one distribution. Account and distribution IDs are environment secrets
+and are masked in the logs. Third-party actions are pinned to commit SHAs.
+
+**One-time setup.**
+
+1. AWS: `CF_DISTRIBUTION_ID=E... ./deploy/setup-aws.sh` with credentials that can manage IAM. It
+   creates the GitHub OIDC provider if the account has none, and the role
+   `metar-service-github-deploy` with the two policies, and prints the role ARN.
+2. GitHub: create the environment `production`, add yourself as a required reviewer, and limit
+   deployment branches to `main`. Add two environment secrets: `AWS_ROLE_ARN` (from step 1) and
+   `CF_DISTRIBUTION_ID`.
+3. Run the workflow in `dry-run` mode and approve it; every step should pass before the first
+   `deploy`.
+
 ## Development
 
 There are no dependencies and no build step: `index.js` is the function, and `index.test.js` uses
