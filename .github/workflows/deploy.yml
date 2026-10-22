@@ -1,7 +1,7 @@
 name: deploy
 
-# Manual only. Runs in the `production` environment: main branch only, and a required reviewer
-# must approve each run. AWS access is through GitHub's OIDC token and a role that trusts only
+# Manual only, and only people with write access can start it. Runs in the `production`
+# environment, which allows only the main branch (no approval step). AWS access is through GitHub's OIDC token and a role that trusts only
 # this repo's production environment (deploy/iam/trust.json); no AWS keys are stored.
 #   dry-run:  assume the role, build and check the zip, validate the code update without changing
 #             anything, smoke-test the live version, show what the CloudFront change would be.

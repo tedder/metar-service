@@ -228,8 +228,8 @@ config's ETag so a concurrent change fails instead of being overwritten.
 
 **Who can run it.** On a public repository only people with write access can start a manual
 workflow, and pull requests from forks never receive secrets. The job also runs in the
-`production` environment, which allows only the `main` branch and needs a required reviewer to
-approve each run. AWS access uses GitHub's OIDC token: the role trusts only
+`production` environment, which allows only the `main` branch; there is no approval step, so
+anyone with write access can deploy (add a required reviewer to the environment if that changes). AWS access uses GitHub's OIDC token: the role trusts only
 `repo:<owner>/<repo>:environment:production` (`deploy/iam/trust.json`), so no other repository,
 branch or workflow can assume it, and no AWS keys are stored. Its permissions
 (`deploy/iam/permissions.json`) cover publishing, reading and invoking this one function and
@@ -241,10 +241,9 @@ and are masked in the logs. Third-party actions are pinned to commit SHAs.
 1. AWS: `CF_DISTRIBUTION_ID=E... ./deploy/setup-aws.sh` with credentials that can manage IAM. It
    creates the GitHub OIDC provider if the account has none, and the role
    `metar-service-github-deploy` with the two policies, and prints the role ARN.
-2. GitHub: create the environment `production`, add yourself as a required reviewer, and limit
-   deployment branches to `main`. Add two environment secrets: `AWS_ROLE_ARN` (from step 1) and
+2. GitHub: create the environment `production` and limit deployment branches to `main`. Add two environment secrets: `AWS_ROLE_ARN` (from step 1) and
    `CF_DISTRIBUTION_ID`.
-3. Run the workflow in `dry-run` mode and approve it; every step should pass before the first
+3. Run the workflow in `dry-run` mode; every step should pass before the first
    `deploy`.
 
 **Deploying a change.**
@@ -254,18 +253,17 @@ and are masked in the logs. Third-party actions are pinned to commit SHAs.
 2. Open the [deploy workflow](https://github.com/tedder/metar-service/actions/workflows/deploy.yml),
    choose **Run workflow**, leave the branch on `main` and the mode on `dry-run`, and run it. From
    a shell: `gh workflow run deploy.yml -R tedder/metar-service -f mode=dry-run`.
-3. The run waits for approval. Open it, choose **Review deployments**, tick `production` and
-   approve. Every step should pass; the run summary shows the live version, the build's
+3. Open the run. Every step should pass; the run summary shows the live version, the build's
    `CodeSha256` and the CloudFront change it would make (for example `/metar* origin-request: 15 -> 16`).
 4. Run the workflow again with mode `deploy` (`gh workflow run deploy.yml -R tedder/metar-service -f mode=deploy`)
-   and approve it. The summary shows the new version number, and the run ends after CloudFront
+   The summary shows the new version number, and the run ends after CloudFront
    reports the distribution deployed (usually a few minutes).
 5. Check a request through CloudFront, for example `?ids=KPDX` on your service URL, and check that the response has a row for KPDX.
 
 **Rolling back.** Run the workflow with mode `rollback` and `version` set to the Lambda version
 to return to (the previous one is in the deploy run's summary as "was N"):
-`gh workflow run deploy.yml -R tedder/metar-service -f mode=rollback -f version=N`, then approve
-it. Rollback publishes nothing; it smoke-tests that version and points `/metar*` back at it.
+`gh workflow run deploy.yml -R tedder/metar-service -f mode=rollback -f version=N`.
+Rollback publishes nothing; it smoke-tests that version and points `/metar*` back at it.
 Old versions are never deleted by the workflow, so any earlier version can be used.
 
 If a run fails before the CloudFront step, nothing user-facing has changed: a failed `deploy`
