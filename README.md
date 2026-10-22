@@ -247,6 +247,32 @@ and are masked in the logs. Third-party actions are pinned to commit SHAs.
 3. Run the workflow in `dry-run` mode and approve it; every step should pass before the first
    `deploy`.
 
+**Deploying a change.**
+
+1. Merge the change to `main` and check that [CI](https://github.com/tedder/metar-service/actions/workflows/ci.yml)
+   passes on that commit.
+2. Open the [deploy workflow](https://github.com/tedder/metar-service/actions/workflows/deploy.yml),
+   choose **Run workflow**, leave the branch on `main` and the mode on `dry-run`, and run it. From
+   a shell: `gh workflow run deploy.yml -R tedder/metar-service -f mode=dry-run`.
+3. The run waits for approval. Open it, choose **Review deployments**, tick `production` and
+   approve. Every step should pass; the run summary shows the live version, the build's
+   `CodeSha256` and the CloudFront change it would make (for example `/metar* origin-request: 15 -> 16`).
+4. Run the workflow again with mode `deploy` (`gh workflow run deploy.yml -R tedder/metar-service -f mode=deploy`)
+   and approve it. The summary shows the new version number, and the run ends after CloudFront
+   reports the distribution deployed (usually a few minutes).
+5. Check a request through CloudFront, for example `?ids=KPDX` on your service URL, and check that the response has a row for KPDX.
+
+**Rolling back.** Run the workflow with mode `rollback` and `version` set to the Lambda version
+to return to (the previous one is in the deploy run's summary as "was N"):
+`gh workflow run deploy.yml -R tedder/metar-service -f mode=rollback -f version=N`, then approve
+it. Rollback publishes nothing; it smoke-tests that version and points `/metar*` back at it.
+Old versions are never deleted by the workflow, so any earlier version can be used.
+
+If a run fails before the CloudFront step, nothing user-facing has changed: a failed `deploy`
+may leave a new published version, which is harmless and unused. If the CloudFront step fails
+after the update was accepted (for example while waiting), the new version still goes live; the
+next run's "Current state" step shows which version CloudFront serves.
+
 ## Development
 
 There are no dependencies and no build step: `index.js` is the function, and `index.test.js` uses
