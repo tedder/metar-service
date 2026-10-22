@@ -1,0 +1,224 @@
+# metar-service
+
+A small METAR proxy for LED weather maps. A device asks for a list of airports; the service fetches
+the current METARs from the Aviation Weather Center (AWC), works out each airport's flight category
+(VFR, MVFR, IFR, LIFR), and answers with one short line per airport: category, an LED color, the
+report's age, a stale flag and the wind. The device sets its LEDs straight from that answer.
+
+It runs as an AWS Lambda@Edge function behind a CloudFront cache behavior, so most requests are
+answered from the cache and the function runs only on a cache miss. There is no other server and
+no database. This repository is the code; it does not point at a running instance.
+
+## Why
+
+A microcontroller that talks to AWC directly has to:
+
+- make HTTPS requests (which needs a TLS stack, enough memory and a correct clock, so NTP first);
+- parse AWC's JSON, including visibility strings like `1 1/4` and `10+` and cloud layer lists;
+- split long airport lists into batches to keep URLs and memory small;
+- carry the flight category rules itself.
+
+With this service the device sends one plain HTTP GET and reads back a few bytes of CSV. The parsing
+and the category rules live here, in tested JavaScript, and devices that ask for the same airports
+share one cached answer.
+
+## How it works
+
+```
+device
+  |  GET /metar?ids=KPDX,KHIO,KTTD&boardid=...&output=csv
+  v
+CloudFront cache behavior (/metar*)
+  |  cache key: ids, boardid, output, help (other query parameters are passed on but not keyed)
+  |  TTL: 300 s
+  |
+  +-- cache hit  -> answered from the edge; the function does not run
+  |
+  +-- cache miss -> Lambda@Edge, origin-request trigger (index.handler)
+                      |  HTTPS to aviationweather.gov, up to 10 airports per request
+                      |  per airport: category, LED color, age, stale, wind
+                      v
+                    synthetic 200 response, Cache-Control: max-age=300
+```
+
+The function never forwards to a real origin: it builds the response itself and returns it from
+the origin-request event, which CloudFront then caches.
+
+## API
+
+### Request
+
+`GET /metar?ids=<ICAO,ICAO,...>[&boardid=<id>][&output=csv|json][&help=1][&debug=<string>]`
+
+| Parameter | Meaning |
+|---|---|
+| `ids` | Comma-separated ICAO codes, any number. Trimmed and uppercased. Entries longer than 4 characters, `NULL`, and anything starting with `OFF` are dropped (LED maps use those as placeholders for unlit positions). Without any valid code, the service returns the help text. |
+| `boardid` | Optional device identifier. Logged; reserved for per-device gating. Part of the cache key. |
+| `output` | `csv` (default) or `json`. |
+| `help` | `1` returns documentation instead of data (no upstream request). |
+| `debug` | Optional string, logged, not part of the cache key. |
+
+Any other query parameters (for example device telemetry) are not used, but they are written to the
+log line for the request, which makes the access and function logs useful for watching a fleet.
+
+### Response (CSV, default)
+
+One line per requested airport, **in the order requested**, with no header row:
+
+```
+KPDX,VFR,0-127-0,8,0,280,9,
+KHIO,MVFR,0-0-127,8,0,0,0,
+KTTD,IFR,127-0-0,62,0,VRB,4,
+K7S3,,75-75-50,,1,,,
+```
+
+| Column | Meaning |
+|---|---|
+| `icao` | Airport code as requested. |
+| `cat` | `VFR`, `MVFR`, `IFR`, `LIFR`; empty if AWC had no report. |
+| `r-g-b` | LED color as decimal `R-G-B`, 0-255 each. |
+| `age_mins` | Minutes since the observation; empty if unknown. |
+| `stale` | `1` if the report is older than 90 minutes or its age is unknown, else `0`. |
+| `wdir` | Wind direction in degrees true, `VRB` for variable, `0` with `wspd` 0 for calm. |
+| `wspd` | Wind speed, knots. |
+| `wgst` | Gust, knots; empty if none. |
+
+An airport AWC doesn't return still gets a line: empty category, color `75-75-50` (dim), `stale` 1.
+
+### Response (JSON)
+
+`output=json` returns an array in the same order:
+
+```json
+[
+  {"icao": "KPDX", "cat": "VFR", "color": [0, 127, 0], "age_mins": 8, "stale": false,
+   "wdir": 280, "wspd": 9, "wgst": null}
+]
+```
+
+### Help
+
+`help=1`, or no valid `ids`, returns the parameter and column descriptions: as `#` comment lines
+followed by the CSV header row for `output=csv`, or as an object for `output=json`. Help responses
+never call AWC.
+
+### Errors
+
+If AWC answers with an error status or unparseable JSON, the whole request returns
+`502 Bad Gateway` with `{"error": "upstream fetch failed"}`, and the details go to the log. An empty
+AWC answer (no reports for a batch) is not an error: those airports come back as missing. A report
+that fails to process is logged and that airport comes back as missing; the rest of the batch is
+unaffected.
+
+## Flight categories
+
+Categories and colors follow FAA Advisory Circular AC 00-45H (Change 2), Table 3-14, "Station Plot
+Weather Categories":
+
+| Category | LED color (R-G-B) | Ceiling (ft AGL) | | Visibility (statute miles) |
+|---|---|---|---|---|
+| LIFR | magenta `255-22-199` | below 500 | and/or | less than 1 |
+| IFR | red `127-0-0` | 500 to below 1,000 | and/or | 1 to less than 3 |
+| MVFR | blue `0-0-127` | 1,000 to 3,000 inclusive | and/or | 3 to 5 inclusive |
+| VFR | green `0-127-0` | above 3,000 | and | above 5 |
+
+- **AWC's category first.** AWC computes the same table and returns it as `fltCat`. When that is one
+  of the four categories the service uses it; otherwise it computes its own (`flightCategory()`).
+- **Ceiling** is the lowest `BKN`, `OVC` or `OVX` (vertical visibility) layer. `FEW`, `SCT`, `SKC`,
+  `CLR` and `CAVOK` are not ceilings.
+- **Visibility** accepts numbers, `10+` (10), whole numbers with trailing text, and fractions such as
+  `1/2` and `1 1/4`.
+- **The worse of ceiling and visibility wins.** A missing value doesn't count against the airport.
+- Through Lambda version 14 the MVFR upper bounds were exclusive, so 3,000 ft or 5 SM showed as VFR.
+  That was fixed in version 15 and is covered by edge-case tests.
+
+## Caching
+
+- The function sets `Cache-Control: max-age=300` on data and help responses. The 502 error response
+  carries no cache header.
+- The CloudFront cache policy should key on `ids`, `boardid`, `output` and `help` only. Keying on
+  anything else (telemetry, debug) would make every request a miss.
+- The order of `ids` is part of the key. A map always sends its airports in LED order, so after the
+  first miss in each 5-minute window its requests are cache hits.
+- `boardid` is keyed so that per-device answers (for example refusing unknown boards) stay correct
+  once gating exists.
+
+## Logging
+
+Everything goes to CloudWatch Logs as one JSON object per line. Lambda@Edge writes its logs in the
+region of the edge location that ran it, so look in the region nearest the devices.
+
+| Event | When |
+|---|---|
+| (request line) | every data request: all query parameters, the parsed `ids`, count, `elapsed_ms` |
+| `upstream_error` | AWC answered with a non-2xx status (URL, status, first 2,000 bytes of the body) |
+| `upstream_parse_error` | AWC's body was not JSON |
+| `metar_process_error` | one report failed to process (the raw report is included) |
+| `handler_error` | the request failed and returned 502 (message, stack, parameters) |
+
+Cache hits never reach the function, so they appear only in CloudFront's own access logs.
+
+## Running your own
+
+1. **Function.** Create a Node.js Lambda in `us-east-1` (a Lambda@Edge requirement) with handler
+   `index.handler`, 128 MB, and a timeout of a few seconds (AWC normally answers in well under one).
+   The deployed function uses the `nodejs24.x` runtime. Give it an execution role that
+   `edgelambda.amazonaws.com` and `lambda.amazonaws.com` can both assume, with basic logging
+   permissions. The code has no dependencies, so the deployment package is `index.js` alone:
+
+   ```sh
+   zip deploy.zip index.js
+   aws lambda update-function-code --region us-east-1 --function-name metar-service \
+     --zip-file fileb://deploy.zip --publish
+   ```
+
+   `--publish` creates a numbered version. Lambda@Edge needs a version, not `$LATEST`.
+
+2. **CloudFront.** Add a cache behavior for `/metar*` to a distribution, with an origin-request
+   association to the function version from step 1. Allow HTTP as well as HTTPS for the viewer
+   protocol, since the point is to serve devices without TLS. Use a cache policy that keys on the
+   four query parameters above, with a default TTL of 300 s, and an origin request policy that
+   forwards all query strings so the function sees them.
+
+3. **Test the version before switching to it.** Invoke the new version with a sample CloudFront
+   origin-request event, check the response, then point the behavior's association at it. To roll
+   back, point the association at the previous version.
+
+Replication to the edge takes a few minutes after an association changes.
+
+## Development
+
+There are no dependencies and no build step: `index.js` is the function, and `index.test.js` uses
+Node's built-in test runner.
+
+```sh
+node --test
+```
+
+Without a local Node install:
+
+```sh
+docker run --rm -v "$PWD":/app:ro -w /app node:24-alpine node --test
+```
+
+The handler's helpers (`visibMiles`, `getLowestCeiling`, `flightCategory`, `ledColor`, `parseIds`,
+`processMetar`, `toCSV` and the help builders) are exported on `exports._test` for the tests.
+
+### Continuous integration
+
+`.github/workflows/ci.yml` runs on every push and pull request:
+
+- **test**: `node --check index.js` and `node --test` on Node 24 (the Lambda runtime);
+- **secrets**: a gitleaks scan of the full history.
+
+GitHub's own secret scanning and push protection are enabled on the repository as well.
+
+## Clients
+
+Any device that can make an HTTP GET and split a line on commas can use it. It was written for a
+CircuitPython LED METAR map, and an ESP-IDF weather lamp uses it too; both set one LED per airport
+from the `r-g-b` column and use `stale` and the wind columns for their own effects.
+
+## License
+
+MIT; see `LICENSE`.
