@@ -54,13 +54,15 @@ the origin-request event, which CloudFront then caches.
 | Parameter | Meaning |
 |---|---|
 | `ids` | Comma-separated ICAO codes, any number. Trimmed and uppercased. Entries longer than 4 characters, `NULL`, and anything starting with `OFF` are dropped (LED maps use those as placeholders for unlit positions). Without any valid code, the service returns the help text. |
-| `boardid` | Optional device identifier. Logged; reserved for per-device gating. Part of the cache key. |
+| `boardid` | Optional device identifier, used as given (not shortened; current clients send 12 hex characters). Logged; part of the cache key, so per-device answers stay separate once gating exists. |
 | `output` | `csv` (default) or `json`. |
 | `help` | `1` returns documentation instead of data (no upstream request). |
 | `debug` | Optional string, logged, not part of the cache key. |
 
-Any other query parameters (for example device telemetry) are not used, but they are written to the
-log line for the request, which makes the access and function logs useful for watching a fleet.
+Clients may add their own parameters (the CircuitPython map sends `crash`, its last reset reason, and
+`fetches`; the ESP32 weather glass sends `fw`, `t` telemetry and `localip`). The origin request policy
+forwards only `ids`, `boardid`, `output`, `help` and `debug`, so the function never sees the others:
+they appear only in CloudFront's access logs, which is the place to watch a fleet from.
 
 ### Response (CSV, default)
 
@@ -151,13 +153,25 @@ region of the edge location that ran it, so look in the region nearest the devic
 
 | Event | When |
 |---|---|
-| (request line) | every data request: all query parameters, the parsed `ids`, count, `elapsed_ms` |
+| (request line) | every data request: the forwarded query parameters, the parsed `ids`, count, `elapsed_ms` |
 | `upstream_error` | AWC answered with a non-2xx status (URL, status, first 2,000 bytes of the body) |
 | `upstream_parse_error` | AWC's body was not JSON |
 | `metar_process_error` | one report failed to process (the raw report is included) |
 | `handler_error` | the request failed and returned 502 (message, stack, parameters) |
 
-Cache hits never reach the function, so they appear only in CloudFront's own access logs.
+Cache hits never reach the function, so they appear only in CloudFront's own access logs, along
+with any query parameters the origin request policy doesn't forward.
+
+## Packaging
+
+The deployment package is a zip containing `index.js` alone, about 10 KB (the deployed one has
+exactly that one file). Nothing else belongs in it:
+
+- **No dependencies.** The code has no `require()` calls; `fetch` and `URLSearchParams` are built into
+  Node 18 and later, so there is no `node_modules` and no `package.json`.
+- **No minifying.** Lambda@Edge allows 50 MB for origin-request functions and a 10 KB file loads in
+  no measurable time, while minified code would make the stack traces in the error log unreadable.
+- Tests, docs and the workflow stay out of the zip.
 
 ## Running your own
 
@@ -177,9 +191,10 @@ Cache hits never reach the function, so they appear only in CloudFront's own acc
 
 2. **CloudFront.** Add a cache behavior for `/metar*` to a distribution, with an origin-request
    association to the function version from step 1. Allow HTTP as well as HTTPS for the viewer
-   protocol, since the point is to serve devices without TLS. Use a cache policy that keys on the
-   four query parameters above, with a default TTL of 300 s, and an origin request policy that
-   forwards all query strings so the function sees them.
+   protocol, since the point is to serve devices without TLS. Use a cache policy whose query-string
+   whitelist is `ids`, `boardid`, `output`, `help` (TTL min 0, default and max 300 s), and an origin
+   request policy that forwards those plus `debug`. Turn on CloudFront access logs if you want the
+   client telemetry parameters, since the function doesn't receive them.
 
 3. **Test the version before switching to it.** Invoke the new version with a sample CloudFront
    origin-request event, check the response, then point the behavior's association at it. To roll

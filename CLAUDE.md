@@ -63,8 +63,9 @@ With 5-min TTL and a device checking every ~9 min, Lambda fires roughly once per
 ### `GET /metar?ids=KPDX,KHIO,KTTD,K7S3&boardid=0740d12f6fce`
 
 - **`ids`** — comma-separated ICAO airport codes
-- **`boardid`** — device board UID, truncated to 12 chars server-side. No auth yet;
-  logged for future gating. Lambda does `boardid.slice(0, 12)`.
+- **`boardid`** — device board UID, used as given (not truncated: an allowlist needs exact
+  matches, and the cache key is built from the raw value before the function runs). No auth yet;
+  logged for future gating. Clients send 12 hex characters.
 
 Plain HTTP. Response ordered to match `ids` order (simplifies device-side indexing).
 
@@ -73,11 +74,11 @@ Plain HTTP. Response ordered to match `ids` order (simplifies device-side indexi
   {"icao": "KPDX", "cat": "VFR",  "color": [0, 127, 0],   "age_mins": 8,  "stale": false},
   {"icao": "KHIO", "cat": "MVFR", "color": [0, 0, 127],   "age_mins": 8,  "stale": false},
   {"icao": "KTTD", "cat": "IFR",  "color": [127, 0, 0],   "age_mins": 62, "stale": true},
-  {"icao": "K7S3", "cat": null,   "color": [255, 255, 0], "age_mins": null, "stale": true}
+  {"icao": "K7S3", "cat": null,   "color": [75, 75, 50],  "age_mins": null, "stale": true}
 ]
 ```
 
-- Missing airports still appear with `cat: null` and yellow color
+- Missing airports still appear with `cat: null` and color `[75, 75, 50]` (dim)
 - `stale: true` when METAR age > 90 minutes
 - Response includes `Cache-Control: max-age=300`
 
@@ -105,7 +106,7 @@ return results in original request order.
 
 ## Lambda@Edge: Key Details
 
-- **Runtime:** Node.js 20.x
+- **Runtime:** Node.js 24.x (`nodejs24.x`; created on 20.x)
 - **Trigger:** Origin request on `/metar*` behavior of `E191F8VQXITFIN`
 - **Deploy region:** `us-east-1` (Lambda@Edge requirement — replicates automatically)
 - **Timeout:** 30s max (upstream fetch is well under 1s)
@@ -116,7 +117,7 @@ return results in original request order.
 const request = event.Records[0].cf.request;
 const params = new URLSearchParams(request.querystring);
 const ids = params.get('ids') || '';
-const boardid = (params.get('boardid') || '').slice(0, 12);
+const boardid = params.get('boardid') || '';
 ```
 
 **Returning synthetic response (no real origin):**
@@ -157,7 +158,7 @@ VFR  → [0, 127, 0]    green
 MVFR → [0, 0, 127]    blue
 IFR  → [127, 0, 0]    red
 LIFR → [255, 22, 199] pink
-null → [255, 255, 0]  yellow
+null → [75, 75, 50]   dim (no report)
 ```
 
 ### Upstream batching
@@ -273,7 +274,7 @@ AWS_PROFILE=pjnet aws lambda publish-version \
 
 **Source of truth: CloudWatch Logs**, region `us-west-2`, log group `/aws/lambda/us-east-1.metar-service`.
 
-Success log line (JSON): all GET params spread in (boardid, debug, output, fetches, crash, etc.), plus `ids` (parsed array), `count`, `elapsed_ms`.
+Success log line (JSON): the forwarded GET params spread in (`ids`, `boardid`, `output`, `help`, `debug`: the origin request policy forwards only these), plus `ids` (parsed array), `count`, `elapsed_ms`. Client telemetry (`crash`, `fetches`, `fw`, `t`, `localip`) never reaches the function; it is only in the CloudFront access logs.
 
 Query with:
 ```bash
@@ -298,7 +299,7 @@ All errors logged via `console.error` → CloudWatch Logs `/aws/lambda/metar-ser
 3. IAM role with `lambda.amazonaws.com` + `edgelambda.amazonaws.com` principals
 4. Lambda function created in `us-east-1` (Node.js 20.x, 128MB, 30s timeout)
 5. Version 1 published
-6. CloudFront cache policy created (ids+boardid in key, TTL 0/300/300)
+6. CloudFront cache policy created (TTL 0/300/300; key whitelist now `ids`, `boardid`, `output`, `help`), origin request policy forwards those plus `debug`
 7. `/metar*` behavior added to `E191F8VQXITFIN` (viewer protocol: allow-all, Lambda@Edge origin-request)
 
 ## Phase 2
