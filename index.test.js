@@ -312,3 +312,120 @@ describe('fetchMetars upstream behavior', () => {
     } finally { restore(); }
   });
 });
+
+describe('poll events to SQS', () => {
+  const m = require('./index');
+  const { sigV4Headers, sendPollEvent, waitUpTo } = m._test;
+  const realFetch = global.fetch;
+  const realErr = console.error;
+  const realLog = console.log;
+  const env = { AWS_ACCESS_KEY_ID: 'AKIDEXAMPLE', AWS_SECRET_ACCESS_KEY: 'wJalrXUtnFEiK7MDENGbPxRfiCYEXAMPLEKEY', AWS_SESSION_TOKEN: 'TOKEN123' };
+  const saved = {};
+  const setEnv = () => { for (const k of Object.keys(env)) { saved[k] = process.env[k]; process.env[k] = env[k]; } };
+  const clearEnv = () => { for (const k of Object.keys(env)) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; } };
+  const restore = () => { global.fetch = realFetch; console.error = realErr; console.log = realLog; clearEnv(); };
+  const event = (qs) => ({ Records: [{ cf: { request: { querystring: qs, clientIp: '203.0.113.9' } } }] });
+  const awc = (url) => ({ ok: true, status: 200, text: async () => JSON.stringify(decodeURIComponent(url.split('ids=')[1]).split(',').map(id => ({ icaoId: id, fltCat: 'VFR', visib: '10+', clouds: [] }))) });
+
+  test('SigV4 signature matches the one botocore produces for the same request', () => {
+    const creds = { accessKeyId: env.AWS_ACCESS_KEY_ID, secretAccessKey: env.AWS_SECRET_ACCESS_KEY, sessionToken: env.AWS_SESSION_TOKEN };
+    const body = 'Action=SendMessage&Version=2012-11-05&MessageBody=' + encodeURIComponent('{"a":"b c"}');
+    const h = sigV4Headers({ host: 'sqs.us-west-2.amazonaws.com', path: '/257269553028/metar-poll-events', body, region: 'us-west-2', service: 'sqs', creds, amzDate: '20261025T031500Z' });
+    assert.ok(h.authorization.endsWith('Signature=a0fe4bf5909bf64e11734dc85200282abd29be66815dd572a45dc64f0a9c6976'));
+    assert.ok(h.authorization.includes('SignedHeaders=content-type;host;x-amz-date;x-amz-security-token'));
+    assert.strictEqual(h['x-amz-security-token'], 'TOKEN123');
+    assert.strictEqual(h.host, undefined);
+  });
+
+  test('sends nothing without credentials', async () => {
+    let calls = 0;
+    global.fetch = async () => { calls++; return { ok: true, text: async () => '' }; };
+    const saved2 = process.env.AWS_ACCESS_KEY_ID; delete process.env.AWS_ACCESS_KEY_ID;
+    try {
+      assert.strictEqual(await sendPollEvent({ boardid: 'x' }), false);
+      assert.strictEqual(calls, 0);
+    } finally { if (saved2 !== undefined) process.env.AWS_ACCESS_KEY_ID = saved2; restore(); }
+  });
+
+  test('posts a signed SendMessage and reports success', async () => {
+    setEnv();
+    let seen;
+    global.fetch = async (url, init) => { seen = { url, init }; return { ok: true, text: async () => '<ok/>' }; };
+    try {
+      assert.strictEqual(await sendPollEvent({ boardid: 'abc', ids: ['KPDX'] }, new Date('2026-10-25T03:15:00Z')), true);
+      assert.ok(seen.url.endsWith('/metar-poll-events'));
+      assert.strictEqual(seen.init.method, 'POST');
+      assert.ok(seen.init.body.startsWith('Action=SendMessage&Version=2012-11-05&MessageBody='));
+      assert.ok(decodeURIComponent(seen.init.body.split('MessageBody=')[1]).includes('"boardid":"abc"'));
+      assert.strictEqual(seen.init.headers['x-amz-date'], '20261025T031500Z');
+      assert.ok(seen.init.headers.authorization.startsWith('AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261025/us-west-2/sqs/aws4_request'));
+    } finally { restore(); }
+  });
+
+  test('a non-200 or a thrown error is logged and not raised', async () => {
+    setEnv();
+    const logged = [];
+    console.error = (l) => logged.push(l);
+    try {
+      global.fetch = async () => ({ ok: false, status: 403, text: async () => 'denied' });
+      assert.strictEqual(await sendPollEvent({ boardid: 'x' }), false);
+      global.fetch = async () => { throw new Error('boom'); };
+      assert.strictEqual(await sendPollEvent({ boardid: 'x' }), false);
+      assert.strictEqual(logged.length, 2);
+      assert.ok(logged.every(l => l.includes('"event":"sqs_error"')));
+    } finally { restore(); }
+  });
+
+  test('waitUpTo returns at the limit for a promise that never settles', async () => {
+    const t0 = Date.now();
+    await waitUpTo(new Promise(() => {}), 40);
+    const dt = Date.now() - t0;
+    assert.ok(dt >= 30 && dt < 500, `took ${dt} ms`);
+  });
+
+  test('handler starts the send before the upstream fetch and still answers if SQS hangs', async () => {
+    setEnv();
+    const order = [];
+    console.log = () => {};
+    global.fetch = (url) => {
+      if (url.includes('sqs.')) { order.push('sqs'); return new Promise(() => {}); }  // never answers
+      order.push('awc');
+      return Promise.resolve(awc(url));
+    };
+    try {
+      const t0 = Date.now();
+      const r = await m.handler(event('ids=KPDX&boardid=abc123'));
+      assert.deepStrictEqual(order, ['sqs', 'awc']);
+      assert.strictEqual(r.status, '200');
+      assert.ok(Date.now() - t0 < 1000);  // waited about 300 ms for SQS, not forever
+    } finally { restore(); }
+  });
+
+  test('handler sends no event for help requests or without a boardid', async () => {
+    setEnv();
+    const urls = [];
+    console.log = () => {};
+    global.fetch = (url) => { urls.push(url); return Promise.resolve(url.includes('sqs.') ? { ok: true, text: async () => '' } : awc(url)); };
+    try {
+      await m.handler(event('ids=KPDX'));           // no boardid
+      await m.handler(event('help=1&boardid=abc')); // help
+      assert.ok(!urls.some(u => u.includes('sqs.')));
+    } finally { restore(); }
+  });
+
+  test('handler sends the event even when the upstream fails', async () => {
+    setEnv();
+    const urls = [];
+    console.error = () => {}; console.log = () => {};
+    global.fetch = (url) => {
+      urls.push(url);
+      if (url.includes('sqs.')) return Promise.resolve({ ok: true, text: async () => '' });
+      return Promise.reject(new Error('down'));
+    };
+    try {
+      const r = await m.handler(event('ids=KPDX&boardid=abc'));
+      assert.strictEqual(r.status, '502');
+      assert.ok(urls.some(u => u.includes('sqs.')));
+    } finally { restore(); }
+  });
+});

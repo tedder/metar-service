@@ -1,10 +1,21 @@
 'use strict';
 
+const crypto = require('node:crypto');
+
 const UPSTREAM_URL = 'https://aviationweather.gov/api/data/metar?format=json&ids=';
 // 47 airports in one request returned all 47 in 0.2 to 0.7 s (tested 2026-10-24); larger sizes are untested
 const BATCH_SIZE = 50;
 const UPSTREAM_TIMEOUT_MS = 4000;
 const UPSTREAM_RETRIES = 1;
+
+// Poll events: one SQS message per cache miss that has a boardid, so a consumer can tell that a
+// device is alive without waiting for the CloudFront logs (5 to 30 minutes late). Lambda@Edge has
+// no environment variables and cannot work after it returns, so the send starts before the
+// upstream fetch and is awaited at the end for at most SQS_WAIT_MS. Failures are logged and ignored.
+const SQS_REGION = 'us-west-2';
+const SQS_QUEUE_URL = 'https://sqs.us-west-2.amazonaws.com/257269553028/metar-poll-events';
+const SQS_REQUEST_TIMEOUT_MS = 1500;
+const SQS_WAIT_MS = 300;
 const STALE_MINUTES = 90;
 
 function visibMiles(v) {
@@ -219,6 +230,64 @@ async function fetchMetars(ids) {
   return results;
 }
 
+// AWS Signature Version 4 for a POST. Written out so the function stays one file with no SDK to
+// load (the SDK costs cold-start time and memory). `creds` is { accessKeyId, secretAccessKey, sessionToken }.
+function sigV4Headers({ host, path, body, region, service, creds, amzDate }) {
+  const hmac = (key, data) => crypto.createHmac('sha256', key).update(data).digest();
+  const sha = (data) => crypto.createHash('sha256').update(data).digest('hex');
+  const dateStamp = amzDate.slice(0, 8);
+  const hdrs = {
+    'content-type': 'application/x-www-form-urlencoded; charset=utf-8',
+    host,
+    'x-amz-date': amzDate,
+  };
+  if (creds.sessionToken) hdrs['x-amz-security-token'] = creds.sessionToken;
+  const names = Object.keys(hdrs).sort();
+  const canonicalHeaders = names.map(n => `${n}:${hdrs[n]}\n`).join('');
+  const signedHeaders = names.join(';');
+  const canonicalRequest = ['POST', path, '', canonicalHeaders, signedHeaders, sha(body)].join('\n');
+  const scope = `${dateStamp}/${region}/${service}/aws4_request`;
+  const toSign = ['AWS4-HMAC-SHA256', amzDate, scope, sha(canonicalRequest)].join('\n');
+  const kSigning = hmac(hmac(hmac(hmac('AWS4' + creds.secretAccessKey, dateStamp), region), service), 'aws4_request');
+  const signature = crypto.createHmac('sha256', kSigning).update(toSign).digest('hex');
+  hdrs.authorization = `AWS4-HMAC-SHA256 Credential=${creds.accessKeyId}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+  delete hdrs.host;  // fetch sets Host itself
+  return hdrs;
+}
+
+// Never rejects. Resolves to true when SQS accepted the message.
+async function sendPollEvent(message, now = new Date()) {
+  const creds = {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+    sessionToken: process.env.AWS_SESSION_TOKEN,
+  };
+  if (!creds.accessKeyId || !creds.secretAccessKey) return false;  // not running in Lambda
+  try {
+    const url = new URL(SQS_QUEUE_URL);
+    const body = 'Action=SendMessage&Version=2012-11-05&MessageBody=' + encodeURIComponent(JSON.stringify(message));
+    const amzDate = now.toISOString().replace(/[-:]|\.\d{3}/g, '');
+    const headers = sigV4Headers({ host: url.host, path: url.pathname, body, region: SQS_REGION, service: 'sqs', creds, amzDate });
+    const resp = await fetch(SQS_QUEUE_URL, { method: 'POST', headers, body, signal: AbortSignal.timeout(SQS_REQUEST_TIMEOUT_MS) });
+    if (!resp.ok) {
+      console.error(JSON.stringify({ event: 'sqs_error', status: resp.status, body: (await resp.text()).slice(0, 500) }));
+      return false;
+    }
+    await resp.text();
+    return true;
+  } catch (err) {
+    console.error(JSON.stringify({ event: 'sqs_error', error: err.message }));
+    return false;
+  }
+}
+
+// Wait for `promise`, but no longer than `ms`
+function waitUpTo(promise, ms) {
+  let timer;
+  return Promise.race([promise, new Promise(resolve => { timer = setTimeout(resolve, ms); })])
+    .finally(() => clearTimeout(timer));
+}
+
 function parseIds(idsParam) {
   return (idsParam || '').split(',')
     .map(s => s.trim().toUpperCase())
@@ -248,6 +317,10 @@ exports.handler = async (event) => {
   }
 
   const t0 = Date.now();
+  // Started now so it overlaps the upstream fetch; awaited in the finally below
+  const polled = boardid
+    ? sendPollEvent({ boardid, ids, ts: new Date().toISOString(), ip: request.clientIp || '' })
+    : Promise.resolve(false);
   try {
     const metarMap = await fetchMetars(ids);
     const results = ids.map(icao => metarMap[icao] || {
@@ -290,8 +363,10 @@ exports.handler = async (event) => {
       headers: { 'content-type': [{ key: 'Content-Type', value: 'application/json; charset=utf-8' }] },
       body: JSON.stringify({ error: 'upstream fetch failed' }),
     };
+  } finally {
+    await waitUpTo(polled, SQS_WAIT_MS);
   }
 };
 
 // Exported for unit tests
-exports._test = { visibMiles, isActualCloudLayer, getLowestCeiling, flightCategory, ledColor, parseIds, processMetar, fetchMetars, toDecColor, toCSV, HELP_COLUMNS, HELP_PARAMS, HELP_NOTES, HELP_HEADER_ROW, helpCsv, helpJson };
+exports._test = { visibMiles, isActualCloudLayer, getLowestCeiling, flightCategory, ledColor, parseIds, processMetar, fetchMetars, sigV4Headers, sendPollEvent, waitUpTo, toDecColor, toCSV, HELP_COLUMNS, HELP_PARAMS, HELP_NOTES, HELP_HEADER_ROW, helpCsv, helpJson };

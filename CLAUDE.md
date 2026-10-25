@@ -333,3 +333,24 @@ Fixed in Lambda version 15 (2026-10-16); edge cases in `index.test.js`. Verified
 --region us-east-1 --zip-file fileb://deploy.zip --publish` → invoke the new version directly
 with a CloudFront event → point distribution `E191F8VQXITFIN` `/metar*` origin-request
 association at the new version. Rollback = point it back. (`AWS_PROFILE=pjnet`)
+
+---
+
+## 2026-10-24: speedup, memory and alarms
+
+- **Code (Lambda version 17, live):** upstream batches go out in parallel (`Promise.all`), `BATCH_SIZE` 50 (47 airports in one request returned in 0.2 to 0.7 s), each attempt cut at 4 s (`AbortSignal.timeout`) with one retry on timeout, network error or 5xx (not 4xx). One failed batch still fails the request (502). AWC documents 100 requests/min and 400 entries per query, no cap on airports per call; sizes above 47 are untested.
+- **Config:** 160 MB (peak use 113 MB), timeout 30 s. 30 s is the Lambda@Edge origin-event maximum; 60 s cannot be associated. Memory is billed as configured, not as used.
+- **Deploy by hand** (the workflow needs a push): `./scripts/build-zip.sh`, `aws lambda update-function-code --publish`, check CodeSha256, `./deploy/smoke-test.sh metar-service N`, `python3 scripts/point_cloudfront.py E191F8VQXITFIN <function arn>:N`, `aws cloudfront wait distribution-deployed`. Rollback: point back to the old version (v16 before this).
+- **Test result (forced misses via fly.tedder.me, 8 map-size and 12 single-airport requests):** map median 0.30 s to 0.09 s warm; single airport unchanged at 0.06 s; first requests on fresh containers 1.5 to 2.4 s. In production the 4 s timeout fired once (map, 02:06 UTC 2026-10-25) and the retry recovered it (5.6 s total). Re-check CloudWatch `elapsed_ms` for the map (`ce897468c922`) after a day or two; before it was median 3.8 s, p99 25.7 s.
+- **Alarms (us-west-2, `deploy/setup-alarms.sh`, idempotent; notifies SNS `errors`: email ted@perljam.net plus AWS Chatbot):** `metar-service-oom` (metric `MetarService/OomKills` from the REPORT line `Error Type: Runtime.OutOfMemory`; 1 in 5 min), `metar-service-memory` (`MaxMemoryUsedMB` from REPORT lines, 144 MB or more), `metar-service-errors` (`handler_error` log lines plus Lambda `Errors`, 2 in 15 min). Count, not rate: only about 30 invocations an hour. Lambda@Edge logs in the serving region; only us-west-2 has traffic.
+- **OOM behavior (forced on a throwaway function 2026-10-24):** the invocation returns `Runtime.OutOfMemory`, the REPORT line shows Max Memory Used equal to the size and `Status: error`, the Lambda `Errors` metric counts 1, and nothing is logged by the handler (so `handler_error` misses it). The alarms were not fired on the real function; only the filters were tested against the real lines.
+- **Cost:** metric filters are free; custom metrics and alarms are not, but are probably inside the free tier (about 3 custom metrics, about 9 of 10 alarm metrics).
+
+## 2026-10-25: poll events to SQS (Lambda version 18)
+
+- **What:** on a cache miss with a `boardid`, the function sends `{boardid, ids, ts, ip}` (`ip` = `request.clientIp`) to the SQS queue `metar-poll-events` (us-west-2, standard, 1-day retention). A consumer on nuc11 turns these into Uptime Kuma heartbeats, so a unit coming back is seen in seconds (CloudFront logs lag 5 to 30 min). `fw` and `localip` are not available to the function: the origin request policy forwards only `ids`, `boardid`, `output`, `help`.
+- **How:** `sendPollEvent` signs the SendMessage POST itself (SigV4 with `node:crypto`, credentials from the runtime's `AWS_*` env vars; no SDK, so no cold-start or memory cost). The send is started before the upstream fetch and awaited in a `finally` for at most `SQS_WAIT_MS` (300 ms), so it overlaps the fetch. Each send has a 1.5 s request timeout. Failures log `{"event":"sqs_error"}` and are ignored; the response never depends on SQS. Lambda@Edge cannot do work after returning, so a send still running when the handler returns can be lost.
+- **Signer check:** `sigV4Headers` produces the same signature as botocore for the same request (test in `index.test.js`).
+- **Measured on version 18:** Lambda time beyond the fetch (Duration minus `elapsed_ms`) median 20.6 ms vs 20.3 ms on version 17; peak memory 114 MB vs 113 MB at 160 MB. 1 of 45 sends timed out (a cold container). Expect an occasional lost message; a unit polls every few minutes, so one is enough.
+- **Setup:** `deploy/setup-sqs.sh` (queue, execution role `sqs:SendMessage`, consumer IAM user). Consumer: `esp32-projects/notmyaeroglass/tools/nmag_queue_consumer.py` in the `~/git/claude` repo, run on nuc11 as systemd service `nmag-queue`, map file `~/.nmag-queue-map.json` (boardid to Kuma push token).
+- **Cost:** SQS free tier is 1M requests a month; 3 devices use about 22k sends plus receives. About $4 a month at 1000 devices (estimate).
