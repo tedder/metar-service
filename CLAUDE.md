@@ -109,8 +109,8 @@ return results in original request order.
 - **Runtime:** Node.js 24.x (`nodejs24.x`; created on 20.x)
 - **Trigger:** Origin request on `/metar*` behavior of `E191F8VQXITFIN`
 - **Deploy region:** `us-east-1` (Lambda@Edge requirement — replicates automatically)
-- **Timeout:** 30s max (upstream fetch is well under 1s)
-- **Memory:** 128MB
+- **Timeout:** 30s. That is the hard limit for Lambda@Edge origin events; 60s cannot be associated. Each upstream attempt is cut at 4s and retried once, so the worst case is about 8s.
+- **Memory:** 160MB (was 128MB, with about 107MB used; billing is on configured memory, so the per-ms price is 1.25 times the old one)
 
 **Reading params from origin request event:**
 ```javascript

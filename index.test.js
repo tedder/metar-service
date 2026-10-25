@@ -192,3 +192,123 @@ describe('colors match FAA AC 00-45H Table 3-14', () => {
   test('IFR red',      () => assert.deepEqual(ledColor('IFR'), [127, 0, 0]));
   test('LIFR magenta', () => assert.deepEqual(ledColor('LIFR'), [255, 22, 199]));
 });
+
+describe('fetchMetars upstream behavior', () => {
+  const { fetchMetars } = require('./index')._test;
+  const ok = (rows) => ({ ok: true, status: 200, text: async () => JSON.stringify(rows) });
+  const row = (id) => ({ icaoId: id, fltCat: 'VFR', visib: '10+', clouds: [], obsTime: Math.floor(Date.now() / 1000) });
+  const realFetch = global.fetch;
+  const realErr = console.error;
+  const restore = () => { global.fetch = realFetch; console.error = realErr; };
+
+  test('splits into batches and sends them all before any resolves', async () => {
+    const ids = Array.from({ length: 120 }, (_, i) => 'K' + String(i).padStart(3, '0'));
+    let inflight = 0, peak = 0;
+    global.fetch = async (url) => {
+      inflight++; peak = Math.max(peak, inflight);
+      await new Promise(r => setTimeout(r, 10));
+      inflight--;
+      return ok(decodeURIComponent(url.split('ids=')[1]).split(',').map(row));
+    };
+    try {
+      const out = await fetchMetars(ids);
+      assert.strictEqual(Object.keys(out).length, 120);
+      assert.strictEqual(peak, 3);  // 120 ids at 50 per batch
+    } finally { restore(); }
+  });
+
+  test('retries once after a failure and then succeeds', async () => {
+    let calls = 0;
+    console.error = () => {};
+    global.fetch = async () => {
+      if (++calls === 1) throw new Error('timed out');
+      return ok([row('KPDX')]);
+    };
+    try {
+      const out = await fetchMetars(['KPDX']);
+      assert.strictEqual(calls, 2);
+      assert.strictEqual(out.KPDX.cat, 'VFR');
+    } finally { restore(); }
+  });
+
+  test('gives up after one retry', async () => {
+    let calls = 0;
+    console.error = () => {};
+    global.fetch = async () => { calls++; throw new Error('down'); };
+    try {
+      await assert.rejects(fetchMetars(['KPDX']), /down/);
+      assert.strictEqual(calls, 2);
+    } finally { restore(); }
+  });
+
+  test('retries a 5xx and then succeeds', async () => {
+    let calls = 0;
+    console.error = () => {};
+    global.fetch = async () => {
+      if (++calls === 1) return { ok: false, status: 503, statusText: 'Unavailable', text: async () => 'busy' };
+      return ok([row('KPDX')]);
+    };
+    try {
+      const out = await fetchMetars(['KPDX']);
+      assert.strictEqual(calls, 2);
+      assert.strictEqual(out.KPDX.cat, 'VFR');
+    } finally { restore(); }
+  });
+
+  test('each attempt carries an abort signal', async () => {
+    const signals = [];
+    console.error = () => {};
+    global.fetch = async (url, init) => {
+      signals.push(init.signal);
+      if (signals.length === 1) throw new Error('timed out');
+      return ok([row('KPDX')]);
+    };
+    try {
+      await fetchMetars(['KPDX']);
+      assert.strictEqual(signals.length, 2);
+      assert.ok(signals.every(sg => sg instanceof AbortSignal && !sg.aborted));
+      assert.notStrictEqual(signals[0], signals[1]);  // a fresh timeout per attempt
+    } finally { restore(); }
+  });
+
+  test('50 airports are one request, 51 are two', async () => {
+    const mk = (n) => Array.from({ length: n }, (_, i) => 'K' + String(i).padStart(3, '0'));
+    for (const [n, want] of [[50, 1], [51, 2]]) {
+      let calls = 0;
+      global.fetch = async (url) => { calls++; return ok(decodeURIComponent(url.split('ids=')[1]).split(',').map(row)); };
+      try {
+        await fetchMetars(mk(n));
+        assert.strictEqual(calls, want);
+      } finally { restore(); }
+    }
+  });
+
+  test('an empty body (204) gives no data without failing', async () => {
+    global.fetch = async () => ({ ok: true, status: 204, text: async () => '' });
+    try {
+      assert.deepStrictEqual(await fetchMetars(['KXXX']), {});
+    } finally { restore(); }
+  });
+
+  test('one failed batch fails the whole request', async () => {
+    const ids = Array.from({ length: 60 }, (_, i) => 'K' + String(i).padStart(3, '0'));
+    console.error = () => {};
+    global.fetch = async (url) => {
+      if (url.includes('K055')) throw new Error('down');
+      return ok(decodeURIComponent(url.split('ids=')[1]).split(',').map(row));
+    };
+    try {
+      await assert.rejects(fetchMetars(ids), /down/);
+    } finally { restore(); }
+  });
+
+  test('does not retry a 4xx', async () => {
+    let calls = 0;
+    console.error = () => {};
+    global.fetch = async () => { calls++; return { ok: false, status: 400, statusText: 'Bad', text: async () => 'no' }; };
+    try {
+      await assert.rejects(fetchMetars(['KPDX']), /HTTP 400/);
+      assert.strictEqual(calls, 1);
+    } finally { restore(); }
+  });
+});

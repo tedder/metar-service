@@ -1,7 +1,10 @@
 'use strict';
 
 const UPSTREAM_URL = 'https://aviationweather.gov/api/data/metar?format=json&ids=';
-const BATCH_SIZE = 10;
+// 47 airports in one request returned all 47 in 0.2 to 0.7 s (tested 2026-10-24); larger sizes are untested
+const BATCH_SIZE = 50;
+const UPSTREAM_TIMEOUT_MS = 4000;
+const UPSTREAM_RETRIES = 1;
 const STALE_MINUTES = 90;
 
 function visibMiles(v) {
@@ -146,23 +149,46 @@ function toCSV(results) {
   ).join('\n');
 }
 
-async function fetchMetars(ids) {
-  const results = {};
-  for (let i = 0; i < ids.length; i += BATCH_SIZE) {
-    const batch = ids.slice(i, i + BATCH_SIZE);
-    const url = UPSTREAM_URL + batch.join(',');
-    const resp = await fetch(url, { headers: { 'User-Agent': 'metar-map-fetcher ted@tedder.me v1.0' } });
-    const rawText = await resp.text();
-    if (!resp.ok) {
+// One upstream request with a short per-attempt timeout and a single retry. AWC normally
+// answers in 150 to 700 ms but sometimes stalls for several seconds (4.4 s seen on a 10-airport
+// request) or for about 20 s (the p99 in the logs); a fresh attempt usually succeeds quickly.
+// Retries on timeout, network error or 5xx; a 4xx is returned as an error right away.
+async function fetchBatch(batch) {
+  const url = UPSTREAM_URL + batch.join(',');
+  let lastErr;
+  for (let attempt = 0; attempt <= UPSTREAM_RETRIES; attempt++) {
+    try {
+      const resp = await fetch(url, {
+        headers: { 'User-Agent': 'metar-map-fetcher ted@tedder.me v1.0' },
+        signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+      });
+      const rawText = await resp.text();
+      if (resp.ok) return { url, resp, rawText };
       console.error(JSON.stringify({
         event: 'upstream_error',
         url,
+        attempt,
         status: resp.status,
         statusText: resp.statusText,
         body: rawText.slice(0, 2000),
       }));
-      throw new Error(`Upstream HTTP ${resp.status}`);
+      lastErr = new Error(`Upstream HTTP ${resp.status}`);
+      if (resp.status < 500) break;
+    } catch (err) {
+      console.error(JSON.stringify({ event: 'upstream_fetch_error', url, attempt, error: err.message }));
+      lastErr = err;
     }
+  }
+  throw lastErr;
+}
+
+async function fetchMetars(ids) {
+  const batches = [];
+  for (let i = 0; i < ids.length; i += BATCH_SIZE) batches.push(ids.slice(i, i + BATCH_SIZE));
+  // Batches go out together, so the total is the slowest batch and not the sum
+  const responses = await Promise.all(batches.map(fetchBatch));
+  const results = {};
+  for (const { url, resp, rawText } of responses) {
     if (rawText.trim() === '') continue;  // 204 No Content or empty body = no data for this batch
     let parsed;
     try {
@@ -268,4 +294,4 @@ exports.handler = async (event) => {
 };
 
 // Exported for unit tests
-exports._test = { visibMiles, isActualCloudLayer, getLowestCeiling, flightCategory, ledColor, parseIds, processMetar, toDecColor, toCSV, HELP_COLUMNS, HELP_PARAMS, HELP_NOTES, HELP_HEADER_ROW, helpCsv, helpJson };
+exports._test = { visibMiles, isActualCloudLayer, getLowestCeiling, flightCategory, ledColor, parseIds, processMetar, fetchMetars, toDecColor, toCSV, HELP_COLUMNS, HELP_PARAMS, HELP_NOTES, HELP_HEADER_ROW, helpCsv, helpJson };
