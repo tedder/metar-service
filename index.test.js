@@ -429,3 +429,36 @@ describe('poll events to SQS', () => {
     } finally { restore(); }
   });
 });
+
+describe('pollMessage', () => {
+  const { pollMessage } = require('./index')._test;
+  const now = new Date('2026-10-27T16:00:00Z');
+  test('base fields only when the device sent no telemetry', () => {
+    const p = new URLSearchParams('ids=KTTD&boardid=9c139ead09fc&output=csv');
+    assert.deepEqual(pollMessage(p, ['KTTD'], '1.2.3.4', now),
+      { boardid: '9c139ead09fc', ids: ['KTTD'], ts: '2026-10-27T16:00:00.000Z', ip: '1.2.3.4' });
+  });
+  test('fw, debug and t copied when present', () => {
+    const p = new URLSearchParams('ids=KRYY&boardid=3485188ebdb4&output=csv&debug=0x2&fw=0.4.21&ch=beta&t=8nWMOSSEAAIABACAUwFoAAIAl2Ao&localip=192.168.0.197');
+    const m = pollMessage(p, ['KRYY'], '', now);
+    assert.equal(m.fw, '0.4.21');
+    assert.equal(m.debug, '0x2');
+    assert.equal(m.t, '8nWMOSSEAAIABACAUwFoAAIAl2Ao');
+    assert.equal(m.localip, undefined);
+    assert.equal(m.ch, undefined);
+  });
+  test('base36 dotted telemetry passes through', () => {
+    const p = new URLSearchParams('ids=KTTD&boardid=x&t=1.t.5j.4e');
+    assert.equal(pollMessage(p, ['KTTD'], '', now).t, '1.t.5j.4e');
+  });
+  test('values are trimmed to URL-safe characters and 64 chars', () => {
+    const p = new URLSearchParams('ids=KTTD&boardid=x&fw=' + encodeURIComponent('0.4"<script>') + '&t=' + 'A'.repeat(100));
+    const m = pollMessage(p, ['KTTD'], '', now);
+    assert.equal(m.fw, '0.4script');
+    assert.equal(m.t.length, 64);
+  });
+  test('empty after cleaning = left out', () => {
+    const p = new URLSearchParams('ids=KTTD&boardid=x&debug=' + encodeURIComponent('<>'));
+    assert.equal('debug' in pollMessage(p, ['KTTD'], '', now), false);
+  });
+});

@@ -175,7 +175,7 @@ Device never batches.
 | Viewer protocol policy | **HTTP and HTTPS** (not redirect) |
 | Allowed HTTP methods | GET, HEAD |
 | Cache policy | Custom: include `ids` + `boardid` query params; TTL min/default/max = 0/300/300 |
-| Origin request policy | Include `ids` + `boardid` in origin request |
+| Origin request policy | Forward `ids`, `boardid`, `output`, `help` (the cache key) plus `t`, `fw`, `debug` (telemetry, not in the cache key) |
 | Lambda@Edge | Origin request: `<function ARN>` |
 | Origin | Dummy (Lambda returns synthetic response before origin is contacted) |
 
@@ -274,7 +274,7 @@ AWS_PROFILE=pjnet aws lambda publish-version \
 
 **Source of truth: CloudWatch Logs**, region `us-west-2`, log group `/aws/lambda/us-east-1.metar-service`.
 
-Success log line (JSON): the forwarded GET params spread in (`ids`, `boardid`, `output`, `help`: the origin request policy forwards only these since v16; v15 also forwarded `debug`), plus `ids` (parsed array), `count`, `elapsed_ms`. Client telemetry (`crash`, `fetches`, `fw`, `t`, `localip`) never reaches the function; it is only in the CloudFront access logs.
+Success log line (JSON): the forwarded GET params spread in (`ids`, `boardid`, `output`, `help`, and since 2026-10-27 also `t`, `fw`, `debug`; v15 forwarded `debug` too, v16-v18 only the four), plus `ids` (parsed array), `count`, `elapsed_ms`. `localip`, `ch` and the map's `crash`/`fetches` still never reach the function; they are only in the CloudFront access logs.
 
 Query with:
 ```bash
@@ -354,3 +354,17 @@ association at the new version. Rollback = point it back. (`AWS_PROFILE=pjnet`)
 - **Measured on version 18:** Lambda time beyond the fetch (Duration minus `elapsed_ms`) median 20.6 ms vs 20.3 ms on version 17; peak memory 114 MB vs 113 MB at 160 MB. 1 of 45 sends timed out (a cold container). Expect an occasional lost message; a unit polls every few minutes, so one is enough.
 - **Setup:** `deploy/setup-sqs.sh` (queue, execution role `sqs:SendMessage`, consumer IAM user). Consumer: **metar-poll-watch** (`metar-poll-watch/` in the `~/git/claude` repo), a Docker container on nuc11 with a web page of the last 24 hours of messages at `http://192.168.3.60:5093/`; it also pushes the Kuma heartbeats. Config `~/compose/metar-poll-watch/config/targets.json` on nuc11 (boardid to name and Kuma push token).
 - **Cost:** SQS free tier is 1M requests a month; 3 devices use about 22k sends plus receives. About $4 a month at 1000 devices (estimate).
+
+## 2026-10-27: device telemetry in poll events (Lambda version 19)
+
+- **What:** the origin request policy `metar-service-origin-request-policy` (bbe267a2-…) now also forwards `t`,
+  `fw` and `debug`. The cache policy is unchanged, so they are **not** in the cache key and arrive on cache misses
+  only (about one per device per 5 min). `pollMessage()` copies them into the SQS message when present, each cut to
+  URL-safe characters and 64 chars: `{boardid, ids, ts, ip, fw?, debug?, t?}`. metar-poll-watch on nuc11 decodes `t`
+  per board kind (`~/git/claude/metar-poll-watch/README.md`).
+- **Deployed by hand** with the workflow's steps (no node on the Mac: tests ran in `node:24-alpine` on nuc11; the
+  zip was checked with the Mac's `unzip`, since busybox unzip lacks `-Z`): version 19, CodeSha256
+  `sRYEZwqCib0mVjI5B6A/4Rt7cMgplsnqPZSSL+nXQpo=`, smoke test OK, `/metar*` 18 -> 19, distribution deployed. First live
+  invocation with telemetry: unit 1, `fw 0.4.21`, `t` v8. Policy backup before the change: `~/tmp/metar-orp/before.json`.
+- **Rollback:** `scripts/point_cloudfront.py E191F8VQXITFIN <arn>:18`; remove `t`, `fw`, `debug` from the origin
+  request policy (harmless to leave: v18 ignores them).

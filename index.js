@@ -281,6 +281,21 @@ async function sendPollEvent(message, now = new Date()) {
   }
 }
 
+// Device telemetry copied into the poll event when the device sent it. CloudFront forwards these
+// (origin request policy) without putting them in the cache key, so they arrive on cache misses only.
+// Values are kept short and to URL-safe characters so a bad client can't bloat or garble a message.
+const POLL_EXTRA_PARAMS = ['fw', 'debug', 't'];
+const POLL_EXTRA_MAX = 64;
+
+function pollMessage(params, ids, ip, now = new Date()) {
+  const msg = { boardid: params.get('boardid') || '', ids, ts: now.toISOString(), ip: ip || '' };
+  for (const k of POLL_EXTRA_PARAMS) {
+    const v = (params.get(k) || '').replace(/[^0-9A-Za-z._-]/g, '').slice(0, POLL_EXTRA_MAX);
+    if (v) msg[k] = v;
+  }
+  return msg;
+}
+
 // Wait for `promise`, but no longer than `ms`
 function waitUpTo(promise, ms) {
   let timer;
@@ -319,7 +334,7 @@ exports.handler = async (event) => {
   const t0 = Date.now();
   // Started now so it overlaps the upstream fetch; awaited in the finally below
   const polled = boardid
-    ? sendPollEvent({ boardid, ids, ts: new Date().toISOString(), ip: request.clientIp || '' })
+    ? sendPollEvent(pollMessage(params, ids, request.clientIp))
     : Promise.resolve(false);
   try {
     const metarMap = await fetchMetars(ids);
@@ -369,4 +384,4 @@ exports.handler = async (event) => {
 };
 
 // Exported for unit tests
-exports._test = { visibMiles, isActualCloudLayer, getLowestCeiling, flightCategory, ledColor, parseIds, processMetar, fetchMetars, sigV4Headers, sendPollEvent, waitUpTo, toDecColor, toCSV, HELP_COLUMNS, HELP_PARAMS, HELP_NOTES, HELP_HEADER_ROW, helpCsv, helpJson };
+exports._test = { visibMiles, isActualCloudLayer, getLowestCeiling, flightCategory, ledColor, parseIds, processMetar, fetchMetars, sigV4Headers, sendPollEvent, pollMessage, waitUpTo, toDecColor, toCSV, HELP_COLUMNS, HELP_PARAMS, HELP_NOTES, HELP_HEADER_ROW, helpCsv, helpJson };
